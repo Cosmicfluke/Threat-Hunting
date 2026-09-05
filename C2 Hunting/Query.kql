@@ -1,0 +1,50 @@
+set query_datetimescope_column = "Timestamp";
+set query_datetimescope_to = datetime(2025-03-14T09:45:00);
+set query_now = datetime(2025-03-14T09:45:00);
+let IPHostLookup = 
+    DeviceNetworkEvents
+    | where Timestamp > ago(15d)
+    | where isnotempty(RemoteUrl)
+    | where RemoteIPType !in ("Private", "Loopback", "LinkLocal")
+    | extend RemoteIP = replace_string(RemoteIP, "::ffff:", "") // Remove ::ffff: from the RemoteIP
+    | where not(ipv4_is_private(RemoteIP)) // exlcude private IP addresses using the function so that only connections to public IPs remain
+    | extend HostName = replace_strings(RemoteUrl, dynamic(["https://", "http://"]), dynamic(["",""])) // remove http:// and https://
+    | extend HostName = replace_regex(HostName, @'\/.*', '') // remove the url path '/path/blah...' from abc.xom/path/blah/... if exists
+    | extend HostName = replace_regex(HostName, @':\d+', '') // remove custom port if exists (host:port)
+    | summarize by RemoteIP, HostName
+;
+let InternetConnections = 
+    DeviceNetworkEvents
+    | where Timestamp > ago(15d)
+    | where RemoteIPType !in ("Private", "Loopback", "LinkLocal")
+    | extend RemoteIP = replace_string(RemoteIP, "::ffff:", "") // Remove ::ffff: from the RemoteIP
+    | where not(ipv4_is_private(RemoteIP)) // exlcude private IP addresses using the function so that only connections to public IPs remain
+    | extend HostName = replace_strings(RemoteUrl, dynamic(["https://", "http://"]), dynamic(["",""])) // remove http:// and https://
+    | extend HostName = replace_regex(HostName, @'\/.*', '') // remove the url path '/path/blah...' from abc.xom/path/blah/... if exists
+    | extend HostName = replace_regex(HostName, @':\d+', '') // remove custom port if exists (host:port)
+    | project-reorder Timestamp, DeviceId, DeviceName, ActionType, RemoteIP, RemotePort, HostName, RemoteUrl
+;
+InternetConnections
+| where ActionType in ("ConnectionSuccess", "ConnectionSuccessAggregatedReport")
+// Get only one record per DeviceId, ActionType, InitiatingProcessFileName, RemoteIP, HostName, RemoteUrl (for query performance)
+| join kind=leftouter IPHostLookup on RemoteIP
+// fill only the HostNames that are empty:
+// if HostName is not empty , keep the original record and remove duplicates caused by IPHostLookup join
+// if HostName is empty in the original record, keep the record
+| where HostName == HostName1 or isempty(HostName)
+| extend HostName = coalesce(HostName, HostName1) // if the HostName is empty, use the HostName from IPHostLookup
+// there are still empty HostNames and there is nothing we can do. filter them out.
+| where isnotempty(HostName)
+| summarize FirstSeen = arg_min(Timestamp, *), // here we are adding the arg_min to get the earliest date
+            HostNameLocalPrevalence = dcount(DeviceId), 
+            ObservedDevices = make_set(DeviceName), 
+            SampleInitiatingProcessFolderPath = take_anyif(InitiatingProcessFolderPath, isnotempty(InitiatingProcessFolderPath)),
+            SampleInitiatingProcessParentFileName = take_anyif(InitiatingProcessParentFileName, isnotempty(InitiatingProcessParentFileName)),
+            ObservedProcesses = make_set_if(InitiatingProcessFileName, isnotempty(InitiatingProcessFileName)),
+            ObservedInitiatingProcessFolderPaths = make_set_if(InitiatingProcessFolderPath, isnotempty(InitiatingProcessFolderPath))
+            by HostName
+| where HostNameLocalPrevalence <= 2
+| where FirstSeen >= ago(1d) // here we are filtering the results 
+| where HostName !endswith ".office.com"
+| where SampleInitiatingProcessFolderPath != "c:\\windows\\systemapps\\microsoft.windows.search_cw5n1h2txyewy\\searchapp.exe"
+| project-reorder FirstSeen, HostName, SampleInitiatingProcessFolderPath, SampleInitiatingProcessParentFileName, ObservedProcesses, ObservedInitiatingProcessFolderPaths, ObservedDevices
