@@ -1,0 +1,41 @@
+set query_datetimescope_column = "Timestamp";
+set query_datetimescope_to = datetime(2025-03-19T09:45:00);
+set query_now = datetime(2025-03-19T09:45:00);
+let network_discovery_all = 
+    DeviceProcessEvents
+    | where Timestamp > ago(15d)
+    | where FileName in~ ("ipconfig.exe", "netstat.exe", "nslookup.exe", "ping.exe", "arp.exe")
+    | summarize commands = make_set(FileName) by InitiatingProcessUniqueId, InitiatingProcessFileName, DeviceName
+    | where array_length(commands) > 3
+    | join kind=inner (
+            DeviceProcessEvents
+            | where Timestamp > ago(15d)
+            | summarize arg_max(Timestamp, *) by InitiatingProcessUniqueId, DeviceId // one raw event is enough to get contextual information
+            // if needed, all columns can be used
+            | project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessIntegrityLevel, InitiatingProcessAccountName, LogonId, InitiatingProcessLogonId, InitiatingProcessUniqueId, InitiatingProcessParentFileName
+        ) 
+        // joining on the initiating process
+        on DeviceName, InitiatingProcessFileName, InitiatingProcessUniqueId
+        | project-away InitiatingProcessUniqueId1, DeviceName1, InitiatingProcessFileName1
+        | sort by DeviceName asc 
+        | join kind=leftouter (
+            IdentityInfo
+            | where Timestamp > ago(15d)
+            | summarize arg_max(Timestamp, *) by AccountUpn
+            | project AccountUpn, AccountName, Department, JobTitle
+        )
+        on AccountName
+        | project-away AccountName1
+        | project-reorder Timestamp
+    ;
+let baseline = 
+    network_discovery_all
+    | where Timestamp between (ago(15d) .. ago(1d))
+;
+// candidates: last day of data
+let candidates = 
+    network_discovery_all
+    | where Timestamp > ago(1d)
+;
+candidates
+| join kind=leftanti baseline on DeviceName, AccountName, InitiatingProcessFileName
