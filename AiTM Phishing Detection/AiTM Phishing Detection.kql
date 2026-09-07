@@ -1,0 +1,266 @@
+// ============================================================================
+// AiTM Phishing / Session Token Theft Hunt
+// Data sources: SigninLogs, AADNonInteractiveUserSignInLogs
+//
+// Primary signals:
+//   - Successful sign-in from an IP not observed in the baseline period
+//   - First observation occurs in the recent detection period
+//   - A new session ID
+//   - No Entra DeviceId in DeviceDetail
+//   - Access to configured monitored applications
+//   - Optional enrichment for session reuse and Entra risk signals
+//
+// Tune the configuration section before use.
+// ============================================================================
+
+
+// ============================================================================
+// OPTIONAL: Historical data / lab replay
+//
+// Uncomment these three lines ONLY when querying historical datasets that
+// require a fixed "now()" value. Leave them commented in production Sentinel
+// or Log Analytics environments.
+// ============================================================================
+
+// set query_datetimescope_column = "TimeGenerated";
+// set query_datetimescope_to = datetime(2026-04-26T23:59:59);
+// set query_now = datetime(2026-04-26T23:59:59);
+
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+// Total investigation window. Default: 14 days.
+let LookbackPeriod = 14d;
+
+// Most recent period where a first-seen IP/session is considered suspicious.
+// Default: final 1 day of the lookback period.
+let RecentPeriod = 1d;
+
+// Minimum score required for output.
+// Start at 3 for focused hunting; lower to 2 for broader review.
+let MinimumRiskScore = 3;
+
+// Add or remove Microsoft Entra application/client IDs as required.
+// Leave the array empty: dynamic([]) to evaluate all application IDs.
+let MonitoredAppIds = dynamic([
+    "4765445b-32c6-49b0-83e6-1d93765276ca", // OfficeHome
+    "9199bf20-a13f-4107-85dc-02114787ef48", // Outlook Web
+    "7eadcef8-456d-4611-9480-4fff72b8b9e2", // My Profile
+    "19db8c3-b2b9-44cc-b339-36da233a3be2",  // My Signins
+    "2793995e-0a7d-40d7-bd35-6968ba142197", // My Apps
+    "ba9ff945-a723-4ab5-a977-bd8c9044fe61", // My Staff
+    "810dcf14-1858-4bf2-8134-4c369fa3235b", // My Access
+    "65d91a3d-ab74-42e6-8a2f-0add61688c74"  // Microsoft Approval Management
+]);
+
+// Application filtering behavior:
+// true  = require access to one or more IDs in MonitoredAppIds.
+// false = evaluate successful sign-ins to all applications.
+let RequireMonitoredApplication = true;
+
+// Optional exclusions. Add approved corporate egress, test accounts,
+// service identities, or known automation accounts after validation.
+let ExcludedUsers = dynamic([]);
+let ExcludedIPs = dynamic([]);
+
+
+// ============================================================================
+// TIME BOUNDARIES
+// ============================================================================
+
+let WindowStart = ago(LookbackPeriod);
+let RecentStart = ago(RecentPeriod);
+
+
+// ============================================================================
+// SUCCESSFUL INTERACTIVE SIGN-INS
+// ============================================================================
+
+let SuccessfulInteractiveSignIns =
+    SigninLogs
+    | where TimeGenerated between (WindowStart .. now())
+    | where tostring(ResultType) == "0"
+    | where isnotempty(UserPrincipalName)
+    | where isnotempty(IPAddress)
+    | where UserPrincipalName !in~ (ExcludedUsers)
+    | where IPAddress !in (ExcludedIPs)
+    | extend
+        DeviceId = tostring(DeviceDetail.deviceId),
+        DeviceName = tostring(DeviceDetail.displayName),
+        OperatingSystem = tostring(DeviceDetail.operatingSystem),
+        Browser = tostring(DeviceDetail.browser),
+        TargetApp = AppId in~ (MonitoredAppIds),
+        IsRiskySignIn =
+            RiskLevelDuringSignIn in~ ("medium", "high")
+            or RiskState in~ ("atRisk", "confirmedCompromised")
+            or RiskEventTypes_V2 has_any (
+                "adversaryInTheMiddle",
+                "anomalousToken",
+                "tokenIssuerAnomaly"
+            )
+    | project
+        TimeGenerated,
+        CreatedDateTime,
+        UserPrincipalName,
+        UserDisplayName,
+        IPAddress,
+        AppId,
+        AppDisplayName,
+        ResourceDisplayName,
+        SessionId,
+        UniqueTokenIdentifier,
+        CorrelationId,
+        DeviceId,
+        DeviceName,
+        OperatingSystem,
+        Browser,
+        Location,
+        LocationDetails,
+        ClientAppUsed,
+        UserAgent,
+        AuthenticationProtocol,
+        AuthenticationRequirement,
+        ConditionalAccessStatus,
+        ResultType,
+        ResultDescription,
+        ResultSignature,
+        RiskLevelDuringSignIn,
+        RiskState,
+        RiskDetail,
+        RiskEventTypes_V2,
+        TargetApp,
+        IsRiskySignIn;
+
+
+// ============================================================================
+// PRIOR BASELINES
+//
+// These establish whether an IP or SessionId has appeared before the final
+// RecentPeriod. They deliberately use the full successful sign-in population,
+// rather than only monitored apps, so "new" is evaluated accurately.
+// ============================================================================
+
+let PriorIPs =
+    SuccessfulInteractiveSignIns
+    | where TimeGenerated < RecentStart
+    | summarize by IPAddress;
+
+let PriorInteractiveSessions =
+    SuccessfulInteractiveSignIns
+    | where TimeGenerated < RecentStart
+    | where isnotempty(SessionId)
+    | summarize by SessionId;
+
+
+// ============================================================================
+// SUCCESSFUL NON-INTERACTIVE SIGN-INS
+//
+// Used to identify whether the session existed before the candidate event.
+// If this table is unavailable in the environment, remove this block and
+// remove PriorNonInteractiveSessions from the later union.
+// ============================================================================
+
+let PriorNonInteractiveSessions =
+    AADNonInteractiveUserSignInLogs
+    | where TimeGenerated between (WindowStart .. RecentStart)
+    | where tostring(ResultType) == "0"
+    | where isnotempty(SessionId)
+    | summarize by SessionId;
+
+let PriorSessions =
+    union PriorInteractiveSessions, PriorNonInteractiveSessions
+    | summarize by SessionId;
+
+
+// ============================================================================
+// SESSION REUSE ENRICHMENT
+//
+// Session reuse from more than one IP can be a useful token replay signal.
+// It is enrichment only, not proof of AiTM phishing.
+// ============================================================================
+
+let SessionIPSummary =
+    SuccessfulInteractiveSignIns
+    | where isnotempty(SessionId)
+    | summarize
+        SessionFirstSeen = min(TimeGenerated),
+        SessionLastSeen = max(TimeGenerated),
+        SessionIPCount = dcount(IPAddress),
+        SessionIPs = make_set(IPAddress, 20),
+        SessionApplications = make_set(AppDisplayName, 20)
+        by UserPrincipalName, SessionId;
+
+
+// ============================================================================
+// DETECTION
+// ============================================================================
+
+SuccessfulInteractiveSignIns
+| where TimeGenerated >= RecentStart
+| where IPAddress !in (PriorIPs)
+| where isnotempty(SessionId)
+| where SessionId !in (PriorSessions)
+| where isempty(DeviceId)
+| where RequireMonitoredApplication == false or TargetApp == true
+| join kind=leftouter (
+    SessionIPSummary
+) on UserPrincipalName, SessionId
+| extend
+    NewIP = true,
+    NewSession = true,
+    MissingDeviceId = true,
+    MonitoredApplicationAccess =
+        iff(RequireMonitoredApplication == false, false, TargetApp),
+    MultiIPSession = SessionIPCount > 1,
+    RiskScore =
+        toint(NewIP)
+        + toint(NewSession)
+        + toint(MissingDeviceId)
+        + toint(MonitoredApplicationAccess)
+        + toint(MultiIPSession)
+        + toint(IsRiskySignIn)
+| where RiskScore >= MinimumRiskScore
+| project
+    TimeGenerated,
+    CreatedDateTime,
+    UserPrincipalName,
+    UserDisplayName,
+    IPAddress,
+    AppId,
+    AppDisplayName,
+    ResourceDisplayName,
+    SessionId,
+    UniqueTokenIdentifier,
+    CorrelationId,
+    DeviceId,
+    DeviceName,
+    OperatingSystem,
+    Browser,
+    Location,
+    LocationDetails,
+    ClientAppUsed,
+    UserAgent,
+    AuthenticationProtocol,
+    AuthenticationRequirement,
+    ConditionalAccessStatus,
+    RiskLevelDuringSignIn,
+    RiskState,
+    RiskDetail,
+    RiskEventTypes_V2,
+    NewIP,
+    NewSession,
+    MissingDeviceId,
+    MonitoredApplicationAccess,
+    MultiIPSession,
+    SessionIPCount,
+    SessionIPs,
+    SessionApplications,
+    SessionFirstSeen,
+    SessionLastSeen,
+    IsRiskySignIn,
+    RiskScore,
+    ResultDescription,
+    ResultSignature
+| order by RiskScore desc, TimeGenerated desc
