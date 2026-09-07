@@ -1,0 +1,145 @@
+// =============================================
+// Scheduled Task Abuse + C2 Detection
+// =============================================
+
+let SchTasksCreates =
+    DeviceProcessEvents
+    | where ActionType =~ "ProcessCreated"
+    | where FileName =~ "schtasks.exe"
+    | where ProcessCommandLine has "create"
+    | where AccountSid != "S-1-5-18"
+    | project
+        TaskCreatedTime = Timestamp,
+        DeviceId,
+        DeviceName,
+        ProcessCommandLine,
+        AccountName,
+        AccountDomain,
+        AccountSid,
+        InitiatingProcessFileName,
+        InitiatingProcessFolderPath,
+        InitiatingProcessCommandLine,
+        InitiatingProcessUniqueId
+    | extend
+        SuspiciousParent =
+            InitiatingProcessFileName in~ (
+                "powershell.exe",
+                "pwsh.exe",
+                "cmd.exe",
+                "wscript.exe",
+                "cscript.exe",
+                "mshta.exe",
+                "winword.exe",
+                "excel.exe",
+                "outlook.exe",
+                "chrome.exe",
+                "msedge.exe",
+                "firefox.exe"
+            ),
+        SuspiciousPath =
+            ProcessCommandLine has_any (
+                "temp",
+                "appdata",
+                "programdata",
+                "users\\public",
+                "downloads"
+            ),
+        SuspiciousCmd =
+            ProcessCommandLine has_any (
+                "powershell",
+                "pwsh",
+                "cmd",
+                "wscript",
+                "cscript",
+                "mshta",
+                "certutil",
+                "bitsadmin",
+                "curl",
+                "wget",
+                "base64",
+                "invoke-webrequest",
+                "downloadstring",
+                "frombase64string"
+            ),
+        NonSystem =
+            AccountName !in~ (
+                "system",
+                "network service",
+                "local service"
+            )
+    | extend
+        Score =
+            toint(SuspiciousParent)
+            + toint(SuspiciousPath)
+            + toint(SuspiciousCmd)
+            + toint(NonSystem);
+
+let NetworkEvents =
+    DeviceNetworkEvents
+    | where RemoteIPType != "Private"
+    | project
+        NetworkTimestamp = Timestamp,
+        DeviceId,
+        NetworkActionType = ActionType,
+        RemoteIP,
+        RemotePort,
+        RemoteUrl,
+        RemoteIPType,
+        InitiatingProcessUniqueId,
+        InitiatingProcessFileName,
+        InitiatingProcessFolderPath
+    | extend
+        IsDoH =
+            RemoteUrl contains "/dns-query",
+
+        SuspiciousTLD =
+            RemoteUrl contains ".xyz"
+            or RemoteUrl contains ".top",
+
+        SuspiciousPort =
+            RemotePort in (8080, 8443)
+            or RemotePort > 10000;
+
+SchTasksCreates
+| join kind=inner (
+    NetworkEvents
+) on DeviceId
+| where NetworkTimestamp >= TaskCreatedTime
+| where NetworkTimestamp <= datetime_add("hour", 1, TaskCreatedTime)
+| extend
+    SuspiciousNetwork =
+        RemotePort in (443, 8080, 8443)
+        or IsDoH
+        or SuspiciousTLD
+        or SuspiciousPort
+| extend
+    FinalScore =
+        Score
+        + 1
+        + toint(SuspiciousNetwork)
+| where FinalScore >= 2
+| project
+    TaskCreatedTime,
+    NetworkTimestamp,
+    DeviceName,
+    AccountName,
+    AccountDomain,
+    AccountSid,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    SuspiciousParent,
+    SuspiciousPath,
+    SuspiciousCmd,
+    NonSystem,
+    NetworkActionType,
+    RemoteIP,
+    RemotePort,
+    RemoteUrl,
+    IsDoH,
+    SuspiciousTLD,
+    SuspiciousPort,
+    SuspiciousNetwork,
+    Score,
+    FinalScore
+| order by TaskCreatedTime desc
